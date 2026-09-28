@@ -399,5 +399,8 @@ app.post('/webhook/wa', (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('Bot whatsapp SSMA activo. v2'));
-const PORT = process.env.PORT || 3000;
+ app.get('/privacidad', (req, res) => {
+   res.send('<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Política de Privacidad</title></head><body style="font-family:Arial,sans-serif;margin:2rem auto;max-width:720px;line-height:1.5"><h1>Política de Privacidad</h1><p><strong>Responsable:</strong> Secury Inovatech.</p><p>El bot de WhatsApp "Reportes de Seguridad Bot" procesa los siguientes datos para operar: número de WhatsApp del remitente, mensajes de texto e imágenes que el usuario envía voluntariamente como evidencia de los recorridos de seguridad, y la obra o sección seleccionada por el usuario.</p><p>Estos datos se utilizan únicamente para registrar y dar seguimiento a los reportes de seguridad solicitados, se almacenan en una base de datos segura y no se comparten con terceros, salvo obligación legal.</p><p>El usuario puede solicitar la corrección o eliminación de sus datos escribiendo al mismo número de WhatsApp del bot.</p><p><em>Última actualización: 28/09/2026.</em></p></body></html>');
+ });
+ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Bot activo en el puerto ${PORT}`));
