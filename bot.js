@@ -109,13 +109,15 @@ async function turnosDisponibles() {
 
 // Memoria permanente (tabla supervisor_turnos): qué obra eligió cada supervisor
 async function memorizarTurno(remitente, turnoId) {
-  await supabase.from('supervisor_turnos')
-    .upsert({ wa_id: remitente, turno_id: turnoId, updated_at: new Date().toISOString() })
-    .catch(e => console.error('memorizarTurno:', e.message));
+  try {
+    await supabase.from('supervisor_turnos')
+      .upsert({ wa_id: remitente, turno_id: turnoId, updated_at: new Date().toISOString() });
+  } catch (e) { console.error('memorizarTurno:', e.message); }
 }
 async function olvidarTurno(remitente) {
-  await supabase.from('supervisor_turnos').delete().eq('wa_id', remitente)
-    .catch(e => console.error('olvidarTurno:', e.message));
+  try {
+    await supabase.from('supervisor_turnos').delete().eq('wa_id', remitente);
+  } catch (e) { console.error('olvidarTurno:', e.message); }
 }
 
 // Resuelve el turno de un remitente:
