@@ -382,6 +382,7 @@ app.get('/webhook/wa', (req, res) => {
 
 // Mensajes de Meta (POST)
 app.post('/webhook/wa', (req, res) => {
+  console.log('POST /webhook/wa RECIBIDO:', JSON.stringify(req.body || {}).slice(0, 1000));
   res.sendStatus(200); // responde de inmediato para no reenviar
   try {
     const body = req.body;
@@ -395,6 +396,6 @@ app.post('/webhook/wa', (req, res) => {
   } catch (ex) { console.error('webhook:', ex.message); }
 });
 
-app.get('/', (req, res) => res.send('Bot whatsapp SSMA activo.'));
+app.get('/', (req, res) => res.send('Bot whatsapp SSMA activo. v2'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Bot activo en el puerto ${PORT}`));

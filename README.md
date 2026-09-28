@@ -33,9 +33,19 @@
 ## Variables importantes
 | Variable | Descripción |
 |----------|-------------|
-| `TURNO_ID` | id del turno en `monitoreo_turnos` (la obra del grupo) |
+| `TURNO_ID` | id del turno en `monitoreo_turnos` (una sola obra) |
 | `OBRA` | nombre de la obra (alternativa si TURNO_ID vacío) |
 | `SUPABASE_SERVICE_KEY` | clave service_role (privada) |
+
+## Varias obras (multi-obra)
+Si hay **varias obras** que suben monitoreo:
+- Deja `TURNO_ID` y `OBRA` **vacíos**.
+- La primera vez que cada supervisor le escribe al bot, este le pregunta
+  **"¿En qué obra estás?"** con la lista de obras activas y elige con un número.
+- El bot **recuerda** su obra (tabla `supervisor_turnos`) y la usa para sus
+  evidencias y avance. Para cambiar: escribe **"cambiar obra"**.
+- ⚠️ Requiere correr el SQL que crea la tabla `supervisor_turnos`
+  (está en `supabase-setup.sql`, sección 10) una sola vez en Supabase.
 
 ## Flujo que hace el bot
 foto/PDF → menú 1-12 → elige sección → sube al bucket `media` → INSERT en
