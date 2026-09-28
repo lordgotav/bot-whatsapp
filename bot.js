@@ -54,13 +54,18 @@ const MENU = [
   { n: 12, clave: 'cierre_permisos', etiqueta: '✅ Cierre de permisos de trabajo', tipo: 'foto_pdf' }
 ];
 
-// Estado en memoria: número del remitente → sección elegida (esperando su evidencia)
-const pendientes = new Map();
+// Estado en memoria por remitente: { paso: 'obra' | 'seccion', clave, etiqueta, tipo, obraTs }
+//  - paso 'obra': está eligiendo su obra (multi-obra)
+//  - paso 'seccion': eligió sección del menú y espera su evidencia
+const sesiones = new Map();
 
 /* ---------------- UTILIDADES ---------------- */
 function hoy() { return new Date().toISOString().slice(0, 10); }
 function horaLocal() { return new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit', hour12: false }); }
 function normNum(n) { return String(n || '').replace(/\D/g, ''); }
+function normaTxt(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
 function mismoCelular(wa, cel) {
   const a = normNum(wa).slice(-10), b = normNum(cel).slice(-10);
   return a && b && a === b;
@@ -87,17 +92,45 @@ async function descargarMedia(mediaId) {
   return { buffer: Buffer.from(await r2.arrayBuffer()), mime: info.mime_type || '' };
 }
 
-async function buscarTurno() {
-  if (TURNO_ID) {
-    const { data } = await supabase.from('monitoreo_turnos').select('*').eq('id', TURNO_ID).limit(1);
-    if (data && data[0]) return data[0];
-  }
-  if (OBRA) {
-    const { data } = await supabase.from('monitoreo_turnos').select('*').eq('obra', OBRA).eq('activo', true).limit(1);
-    if (data && data[0]) return data[0];
-  }
-  const { data } = await supabase.from('monitoreo_turnos').select('*').eq('activo', true).order('created_at', { ascending: false }).limit(1);
-  return (data && data[0]) || null;
+// Lista de turnos activos (para multi-obra y para elegir obra)
+async function turnosDisponibles() {
+  const { data, error } = await supabase.from('monitoreo_turnos').select('*').eq('activo', true).order('created_at', { ascending: false });
+  if (error) { console.error('turnosDisponibles:', error.message); return []; }
+  return data || [];
+}
+
+// Memoria permanente (tabla supervisor_turnos): qué obra eligió cada supervisor
+async function memorizarTurno(remitente, turnoId) {
+  await supabase.from('supervisor_turnos')
+    .upsert({ wa_id: remitente, turno_id: turnoId, updated_at: new Date().toISOString() })
+    .catch(e => console.error('memorizarTurno:', e.message));
+}
+async function olvidarTurno(remitente) {
+  await supabase.from('supervisor_turnos').delete().eq('wa_id', remitente)
+    .catch(e => console.error('olvidarTurno:', e.message));
+}
+
+// Resuelve el turno de un remitente:
+//  - si TURNO_ID u OBRA están fijos en .env, usa ese (modo una sola obra)
+//  - si no, usa la obra que el supervisor eligió (guardada en supervisor_turnos)
+//  - devuelve null si falta elegir obra (multi-obra) o no hay turno
+async function resolverTurno(remitente) {
+  try {
+    if (TURNO_ID) {
+      const { data } = await supabase.from('monitoreo_turnos').select('*').eq('id', TURNO_ID).limit(1);
+      if (data && data[0]) return data[0];
+    }
+    if (OBRA) {
+      const { data } = await supabase.from('monitoreo_turnos').select('*').eq('obra', OBRA).eq('activo', true).limit(1);
+      if (data && data[0]) return data[0];
+    }
+    const { data: mem } = await supabase.from('supervisor_turnos').select('turno_id').eq('wa_id', remitente).limit(1);
+    if (mem && mem[0]) {
+      const { data: t } = await supabase.from('monitoreo_turnos').select('*').eq('id', mem[0].turno_id).eq('activo', true).limit(1);
+      if (t && t[0]) return t[0];
+    }
+    return null;
+  } catch (e) { console.error('resolverTurno:', e.message); return null; }
 }
 
 async function buscarUsuario(waId) {
@@ -139,10 +172,58 @@ function comentario(pct) {
   return '👣 Vas empezando, ve completando los puntos.';
 }
 
+/* ---------------- MULTI-OBRA: preguntar y guardar la obra del supervisor ---------------- */
+async function preguntarObra(remitente, destinatario, mensajeInicial) {
+  if (TURNO_ID || OBRA) return; // modo una sola obra: no preguntar
+  const ts = (await turnosDisponibles()).filter(t => t.activo !== false);
+  if (!ts.length) { await enviar(destinatario, '⚠️ No hay turnos activos en monitoreo_turnos. Configúralos en la app.'); return; }
+  sesiones.set(remitente, { paso: 'obra', obraTs: ts });
+  await enviar(destinatario,
+    (mensajeInicial || '🏗️ ¿En qué obra estás? Escribe el *nombre* de la obra o su *número*:') + '\n\n' +
+    ts.map((t, i) => `${i + 1}) ${t.obra}`).join('\n') +
+    '\n\n(0) para cancelar.');
+}
+
+async function elegirObra(remitente, destinatario, texto) {
+  const sesion = sesiones.get(remitente) || {};
+  const ts = sesion.obraTs || (await turnosDisponibles()).filter(t => t.activo !== false);
+
+  // 1) Intentar por número (1, 2, 3...)
+  const idx = Number(texto) - 1;
+  if (Number.isInteger(idx) && idx >= 0 && idx < ts.length) {
+    return elegirObraConfirmada(remitente, destinatario, ts[idx]);
+  }
+
+  // 2) Intentar por nombre escrito (sin acentos ni mayúsculas)
+  const q = normaTxt(texto);
+  const coinciden = ts.filter(t => {
+    const nm = normaTxt(t.obra);
+    return nm === q || nm.includes(q) || q.includes(nm);
+  });
+
+  if (coinciden.length === 1) {
+    return elegirObraConfirmada(remitente, destinatario, coinciden[0]);
+  }
+  if (coinciden.length > 1) {
+    sesiones.set(remitente, { paso: 'obra', obraTs: coinciden });
+    await enviar(destinatario, 'Hay varias obras con ese nombre, dime el número:\n\n' +
+      coinciden.map((t, i) => `${i + 1}) ${t.obra}`).join('\n'));
+    return;
+  }
+  await enviar(destinatario, '⚠️ No encontré esa obra. Escribe el nombre completo o el número de la lista:\n\n' +
+    ts.map((t, i) => `${i + 1}) ${t.obra}`).join('\n'));
+}
+
+async function elegirObraConfirmada(remitente, destinatario, turno) {
+  await memorizarTurno(remitente, turno.id);
+  sesiones.delete(remitente);
+  await enviar(destinatario, `✅ Obra *'${turno.obra}'* seleccionada.\n\n` + textoMenu());
+}
+
 /* ---------------- GUARDADO DE EVIDENCIAS ---------------- */
 async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tipoMsg) {
-  const turno = await buscarTurno();
-  if (!turno) { await enviar(destinatario, '⚠️ No encontré un turno activo en monitoreo_turnos. Configúralo en la app.'); return; }
+  const turno = await resolverTurno(remitente);
+  if (!turno) { await enviar(destinatario, '⚠️ No encontré tu obra. Escribe *cambiar obra* para elegirla.'); return; }
 
   let mediaJson = null;
   try {
@@ -180,13 +261,13 @@ async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tip
     console.error('guardarEvidencia:', ex.message);
     await enviar(destinatario, '⚠️ Ocurrió un error al subir la evidencia. Inténtalo de nuevo.');
   } finally {
-    pendientes.delete(remitente);
+    sesiones.delete(remitente);
   }
 }
 
 async function guardarTextoFuerza(remitente, destinatario, seccion, texto) {
-  const turno = await buscarTurno();
-  if (!turno) { await enviar(destinatario, '⚠️ No encontré un turno activo en monitoreo_turnos.'); return; }
+  const turno = await resolverTurno(remitente);
+  if (!turno) { await enviar(destinatario, '⚠️ No encontré tu obra. Escribe *cambiar obra* para elegirla.'); return; }
   try {
     const usuario = await buscarUsuario(remitente);
     const userId = usuario ? usuario.id : uuidDeRemitente(remitente);
@@ -205,7 +286,7 @@ async function guardarTextoFuerza(remitente, destinatario, seccion, texto) {
     console.error('guardarTextoFuerza:', ex.message);
     await enviar(destinatario, '⚠️ Ocurrió un error al guardar. Inténtalo de nuevo.');
   } finally {
-    pendientes.delete(remitente);
+    sesiones.delete(remitente);
   }
 }
 
@@ -214,30 +295,49 @@ async function procesar(val, msg) {
   const remitente = msg.from;
   const destinatario = (msg.context && msg.context.group_id) || remitente; // grupo o DM
   const tipo = msg.type;
-  const pend = pendientes.get(remitente);
+  const esTexto = tipo === 'text';
+  const texto = esTexto ? ((msg.text && msg.text.body) || '').trim() : '';
+  const sesion = sesiones.get(remitente) || {};
+
+  // Comando para cambiar de obra (multi-obra)
+  if (esTexto && /^(cambiar|cambio|obra)\b/i.test(texto)) {
+    await olvidarTurno(remitente);
+    return preguntarObra(remitente, destinatario, '🏗️ ¿A qué obra te cambias? Escribe el *nombre* o el *número*:');
+  }
+
+  // Está eligiendo obra → el número que mande es su obra
+  if (sesion.paso === 'obra') {
+    if (esTexto && texto !== '0') return elegirObra(remitente, destinatario, texto);
+    if (esTexto && texto === '0') { sesiones.delete(remitente); await enviar(destinatario, '✅ Cancelado.'); return; }
+    await enviar(destinatario, 'Responde con el número de tu obra de la lista.');
+    return;
+  }
+
+  // Resuelve el turno (obra fija en .env u obra que ya eligió el supervisor)
+  const turno = await resolverTurno(remitente);
+  if (!turno) {
+    if (!TURNO_ID && !OBRA) return preguntarObra(remitente, destinatario); // multi-obra: aún sin elegir
+    await enviar(destinatario, '⚠️ No encontré un turno activo en monitoreo_turnos. Configúralo en la app.');
+    return;
+  }
 
   // Llega FOTO / PDF y el supervisor ya eligió sección → guardar
-  if (pend && (tipo === 'image' || tipo === 'document')) {
+  if (sesion.paso === 'seccion' && (tipo === 'image' || tipo === 'document')) {
     const mediaMeta = tipo === 'image' ? msg.image : msg.document;
-    if (tipo === 'document' && pend.tipo === 'foto' && !(mediaMeta.mime_type || '').includes('pdf')) {
-      // sección que pide foto pero llegó PDF sin permisos: se acepta igual
-    }
-    return guardarEvidencia(remitente, destinatario, pend, mediaMeta, tipo);
+    return guardarEvidencia(remitente, destinatario, sesion, mediaMeta, tipo);
   }
 
   // Llega TEXTO
-  if (tipo === 'text') {
-    const texto = ((msg.text && msg.text.body) || '').trim();
-
+  if (esTexto) {
     // Sección "fuerza de trabajo" espera texto del informe
-    if (pend && pend.tipo === 'texto' && texto !== '0') {
-      return guardarTextoFuerza(remitente, destinatario, pend, texto);
+    if (sesion.paso === 'seccion' && sesion.tipo === 'texto' && texto !== '0') {
+      return guardarTextoFuerza(remitente, destinatario, sesion, texto);
     }
 
     // Elige sección 1-12
     const opcion = MENU.find(m => String(m.n) === texto);
     if (opcion) {
-      pendientes.set(remitente, opcion);
+      sesiones.set(remitente, { paso: 'seccion', clave: opcion.clave, etiqueta: opcion.etiqueta, tipo: opcion.tipo });
       if (opcion.tipo === 'texto') {
         await enviar(destinatario, `${opcion.etiqueta}\n\nEscribe el informe de fuerza de trabajo (o "0" para cancelar).`);
       } else {
@@ -247,16 +347,16 @@ async function procesar(val, msg) {
       return;
     }
 
-    if (texto === '0') { pendientes.delete(remitente); await enviar(destinatario, '✅ Sección cancelada. No se guardó nada.'); return; }
+    if (texto === '0') { sesiones.delete(remitente); await enviar(destinatario, '✅ Sección cancelada. No se guardó nada.'); return; }
 
     // Menú / ayuda / cualquier otro texto sin sección en curso
-    if (!pend) { await enviar(destinatario, textoMenu()); return; }
+    if (sesion.paso !== 'seccion') { await enviar(destinatario, textoMenu()); return; }
     await enviar(destinatario, 'Sigue en el mismo punto: ' + textoMenu());
     return;
   }
 
   // Llega algo sin haber elegido sección (foto inicial, voz, etc.)
-  if (!pend) { await enviar(destinatario, textoMenu()); }
+  if (sesion.paso !== 'seccion') { await enviar(destinatario, textoMenu()); }
 }
 
 /* ---------------- WEBHOOK (Meta <-> Bot) ---------------- */
