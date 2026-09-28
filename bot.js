@@ -78,11 +78,19 @@ function textoMenu() {
 }
 
 async function enviar(destinatario, body) {
-  await fetch(`${GRAPH_URL}/${PHONE_NUMBER_ID}/messages`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messaging_product: 'whatsapp', to: destinatario, type: 'text', text: { body } })
-  });
+  try {
+    const res = await fetch(`${GRAPH_URL}/${PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: destinatario, type: 'text', text: { body } })
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      console.error('enviar ERROR', res.status, txt.slice(0, 500));
+    } else {
+      console.log('enviar OK ->', destinatario);
+    }
+  } catch (e) { console.error('enviar:', e.message); }
 }
 
 async function descargarMedia(mediaId) {
@@ -380,6 +388,7 @@ app.post('/webhook/wa', (req, res) => {
     const value = body && body.entry && body.entry[0] && body.entry[0].changes && body.entry[0].changes[0] && body.entry[0].changes[0].value;
     if (value && value.messages) {
       for (const msg of value.messages) {
+        console.log(`Mensaje recibido de ${msg.from || '?'} tipo ${msg.type || '?'}`);
         procesar(value, msg).catch(err => console.error('procesar:', err.message));
       }
     }
