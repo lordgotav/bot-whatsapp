@@ -4,6 +4,11 @@
 //  sube la evidencia a Supabase (bucket "media") y registra en
 //  monitoreo_envios, respondiendo con el avance del turno.
 // ------------------------------------------------------------
+//  Proveedor de WhatsApp (variable PROVEEDOR en .env):
+//   - 'meta'   (predeterminado): WhatsApp Cloud API (Meta)
+//   - 'zernio' : Zernio API (https://zernio.com) — oficial, sin
+//     crear app en Meta; solo API key + webhook /webhook/zernio
+// ------------------------------------------------------------
 //  Requiere Node 18+ (instala: https://nodejs.org)
 //  Instalación local (una vez):   npm install
 //  Correr localmente:             npm start
@@ -12,14 +17,25 @@
 
 require('dotenv').config();
 const express = require('express');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
 /* ---------------- CONFIGURACIÓN (se carga desde .env) ---------------- */
+const PROVEEDOR = (process.env.PROVEEDOR || 'meta').toLowerCase();
+
+// --- Modo Meta (WhatsApp Cloud API) ---
 const GRAPH_VERSION = process.env.GRAPH_VERSION || 'v19.0';
 const GRAPH_URL = `https://graph.facebook.com/${GRAPH_VERSION}`;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'mi-token-de-verificacion';
+
+// --- Modo Zernio (API oficial via Zernio) ---
+const ZERNIO_URL = 'https://zernio.com/api/v1';
+const ZERNIO_API_KEY = process.env.ZERNIO_API_KEY;
+// Secret que defines tú en POST /v1/webhooks/settings (firma HMAC de los webhooks).
+// Si lo dejas vacío, el bot NO valida la firma (menos seguro).
+const ZERNIO_WEBHOOK_SECRET = process.env.ZERNIO_WEBHOOK_SECRET || '';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -29,14 +45,20 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const TURNO_ID = process.env.TURNO_ID ? Number(process.env.TURNO_ID) : null;
 const OBRA = process.env.OBRA || '';
 
-if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+if (PROVEEDOR === 'zernio') {
+  if (!ZERNIO_API_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    console.error('Faltan variables ZERNIO_API_KEY, SUPABASE_URL o SUPABASE_SERVICE_KEY. Revisa tu archivo .env');
+    process.exit(1);
+  }
+} else if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('Faltan variables de entorno. Revisa tu archivo .env');
   process.exit(1);
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const app = express();
-app.use(express.json({ limit: '15mb' }));
+// El verify captura el body crudo (lo necesita la firma HMAC de Zernio).
+app.use(express.json({ limit: '15mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
 
 /* ---------------- MENÚ 1-12 → CLAVES REALES DE TU BASE ---------------- */
 const MENU = [
@@ -54,10 +76,38 @@ const MENU = [
   { n: 12, clave: 'cierre_permisos', etiqueta: '✅ Cierre de permisos de trabajo', tipo: 'foto_pdf' }
 ];
 
-// Estado en memoria por remitente: { paso: 'obra' | 'seccion', clave, etiqueta, tipo, obraTs }
+// Estado en memoria por remitente: { paso: 'obra' | 'seccion' | 'login_usuario' | 'login_clave', ... }
 //  - paso 'obra': está eligiendo su obra (multi-obra)
 //  - paso 'seccion': eligió sección del menú y espera su evidencia
+//  - paso 'login_*': se está identificando (usuario + contraseña)
 const sesiones = new Map();
+
+// Remitentes ya identificados (usuario + contraseña correctos)
+//  wa_id -> { user_id, usuario, nombre }
+const autenticados = new Map();
+
+// Canales Zernio para responder (normNum(wa) -> { conversationId, accountId })
+const canales = new Map();
+let zernioAccountId = null;
+
+// Dedupe de webhooks Zernio (sus eventos llegan "al menos una vez")
+const vistos = new Set();
+
+function intlWaId(waId) { const d = normNum(waId); return (d.startsWith('+') ? '' : '+') + d; }
+
+function recordarCanal(destinatario, conversationId, accountId) {
+  if (!destinatario || !conversationId || !accountId) return;
+  zernioAccountId = accountId;
+  canales.set(normNum(destinatario), { conversationId, accountId });
+}
+
+function firmaValida(rawBody, sig) {
+  if (!ZERNIO_WEBHOOK_SECRET) return true; // sin secret configurado no se valida (recomendable ponerlo)
+  if (!rawBody || !sig) return false;
+  const calc = crypto.createHmac('sha256', ZERNIO_WEBHOOK_SECRET).update(rawBody).digest('hex');
+  const a = Buffer.from(calc), b = Buffer.from(sig);
+  return a.length === b.length && a.equals(b);
+}
 
 /* ---------------- UTILIDADES ---------------- */
 function hoy() { return new Date().toISOString().slice(0, 10); }
@@ -78,6 +128,7 @@ function textoMenu() {
 }
 
 async function enviar(destinatario, body) {
+  if (PROVEEDOR === 'zernio') return enviarZernio(destinatario, body);
   try {
     const res = await fetch(`${GRAPH_URL}/${PHONE_NUMBER_ID}/messages`, {
       method: 'POST',
@@ -93,8 +144,53 @@ async function enviar(destinatario, body) {
   } catch (e) { console.error('enviar:', e.message); }
 }
 
-async function descargarMedia(mediaId) {
-  const r1 = await fetch(`${GRAPH_URL}/${mediaId}`, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
+// Envío por Zernio: se responde dentro de la conversación que abrió el usuario.
+async function enviarZernio(destinatario, body) {
+  try {
+    let canal = canales.get(normNum(destinatario));
+    if (!canal) {
+      if (!zernioAccountId) { console.error('enviarZernio: sin canal ni cuenta para', destinatario); return; }
+      const resC = await fetch(`${ZERNIO_URL}/inbox/conversations`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${ZERNIO_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ accountId: zernioAccountId, participantId: intlWaId(destinatario), message: body })
+      });
+      const jC = await resC.json().catch(() => ({}));
+      if (!resC.ok) { console.error('enviarZernio crearConversacion ERROR', resC.status, JSON.stringify(jC).slice(0, 500)); return; }
+      if (jC && jC.data && jC.data.conversationId) {
+        canal = { conversationId: jC.data.conversationId, accountId: zernioAccountId };
+        canales.set(normNum(destinatario), canal);
+        console.log('enviar OK ->', destinatario);
+        return;
+      }
+      console.error('enviarZernio: la conversación no regresó id'); return;
+    }
+    const res = await fetch(`${ZERNIO_URL}/inbox/conversations/${canal.conversationId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ZERNIO_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: canal.accountId, message: body })
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      console.error('enviarZernio ERROR', res.status, txt.slice(0, 500));
+    } else {
+      console.log('enviar OK ->', destinatario);
+    }
+  } catch (e) { console.error('enviarZernio:', e.message); }
+}
+
+// Descarga la media entrante. Con Zernio llega un URL autenticado
+// (hay que pedirlo con el API key); con Meta llega el id de Graph.
+async function descargarMedia(media) {
+  const mediaObj = (media && typeof media === 'object') ? media : {};
+  if (mediaObj.url) {
+    const token = PROVEEDOR === 'zernio' ? ZERNIO_API_KEY : WHATSAPP_TOKEN;
+    const r2 = await fetch(mediaObj.url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!r2.ok) throw new Error('media HTTP ' + r2.status);
+    const mime = mediaObj.mime_type || mediaObj.mimeType || '';
+    return { buffer: Buffer.from(await r2.arrayBuffer()), mime };
+  }
+  const r1 = await fetch(`${GRAPH_URL}/${media}`, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
   const info = await r1.json();
   const r2 = await fetch(info.url, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
   return { buffer: Buffer.from(await r2.arrayBuffer()), mime: info.mime_type || '' };
@@ -237,7 +333,7 @@ async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tip
 
   let mediaJson = null;
   try {
-    const { buffer, mime } = await descargarMedia(mediaMeta.id);
+    const { buffer, mime } = await descargarMedia(mediaMeta);
     // Subir al bucket "media" (la misma ruta que usa la app)
     const esPdf = mime === 'application/pdf' || (mediaMeta.mime_type || '').includes('pdf');
     const ext = esPdf ? 'pdf' : 'jpg';
@@ -300,6 +396,59 @@ async function guardarTextoFuerza(remitente, destinatario, seccion, texto) {
   }
 }
 
+/* ---------------- SEGURIDAD: usuario + contraseña ---------------- */
+// La clave se guarda en Supabase como hash bcrypt (pgcrypto.crypt).
+// La verificación la hace la función RPC verificar_credencial (nunca lee hashes el bot).
+function estaAutenticado(remitente) { return autenticados.has(remitente); }
+
+async function iniciarLogin(remitente, destinatario) {
+  sesiones.set(remitente, { paso: 'login_usuario' });
+  await enviar(destinatario, '🔐 Para reportar necesitas identificarte.\n\nEscribe tu *usuario* (o "0" para cancelar).');
+}
+
+// Procesa los pasos del login. Devuelve true si consumió el mensaje.
+async function procesarLogin(remitente, destinatario, sesion, texto) {
+  if (texto === '0') {
+    sesiones.delete(remitente);
+    await enviar(destinatario, '✅ Identificación cancelada.');
+    return true;
+  }
+  if (sesion.paso === 'login_usuario') {
+    sesiones.set(remitente, { paso: 'login_clave', usuario: texto });
+    await enviar(destinatario, 'Ahora escribe tu *contraseña* (o "0" para cancelar).');
+    return true;
+  }
+  if (sesion.paso === 'login_clave') {
+    try {
+      const { data } = await supabase.rpc('verificar_credencial', { p_usuario: sesion.usuario, p_clave: texto });
+      const ok = data && data[0] && data[0].usuario;
+      if (!ok) {
+        sesiones.delete(remitente);
+        await enviar(destinatario, '❌ Usuario o contraseña incorrectos. Vuelve a escribir tu *usuario*.');
+        return true;
+      }
+      autenticados.set(remitente, {
+        user_id: data[0].user_id || null,
+        usuario: data[0].usuario,
+        nombre: data[0].perfil_nombre || sesion.usuario
+      });
+      sesiones.delete(remitente);
+      await enviar(destinatario, `✅ ¡Hola ${data[0].perfil_nombre || sesion.usuario}! Identificación correcta.`);
+      if (!TURNO_ID && !OBRA) return preguntarObra(remitente, destinatario); // multi-obra: elige su obra
+      const turno = await resolverTurno(remitente);
+      if (!turno) { await enviar(destinatario, '⚠️ No hay un turno activo para tu obra. Configúralo en la app.'); return true; }
+      await enviar(destinatario, textoMenu());
+      return true;
+    } catch (e) {
+      console.error('procesarLogin:', e.message);
+      sesiones.delete(remitente);
+      await enviar(destinatario, '⚠️ Falló la verificación. Vuelve a escribir tu *usuario*.');
+      return true;
+    }
+  }
+  return false;
+}
+
 /* ---------------- PROCESAR MENSAJES ---------------- */
 async function procesar(val, msg) {
   const remitente = msg.from;
@@ -308,6 +457,16 @@ async function procesar(val, msg) {
   const esTexto = tipo === 'text';
   const texto = esTexto ? ((msg.text && msg.text.body) || '').trim() : '';
   const sesion = sesiones.get(remitente) || {};
+
+  // 🔐 SEGURIDAD: sin usuario+contraseña no se puede hacer nada
+  if (sesion.paso === 'login_usuario' || sesion.paso === 'login_clave') {
+    if (esTexto) return procesarLogin(remitente, destinatario, sesion, texto);
+    await enviar(destinatario, 'Escribe solo texto (usuario o contraseña).');
+    return;
+  }
+  if (!estaAutenticado(remitente)) {
+    return iniciarLogin(remitente, destinatario);
+  }
 
   // Comando para cambiar de obra (multi-obra)
   if (esTexto && /^(cambiar|cambio|obra)\b/i.test(texto)) {
@@ -398,7 +557,47 @@ app.post('/webhook/wa', (req, res) => {
   } catch (ex) { console.error('webhook:', ex.message); }
 });
 
-app.get('/', (req, res) => res.send('Bot whatsapp SSMA activo. v2'));
+// Webhook de Zernio (PROVEEDOR=zernio). Sin GET de verificación: Zernio no lo exige.
+// Firma HMAC-SHA256 (X-Zernio-Signature) con el secret que definas.
+app.post('/webhook/zernio', (req, res) => {
+  console.log('POST /webhook/zernio RECIBIDO:', JSON.stringify(req.body || {}).slice(0, 1000));
+  if (!firmaValida(req.rawBody, req.headers['x-zernio-signature'])) {
+    console.error('zernio: firma inválida');
+    return res.sendStatus(401);
+  }
+  res.sendStatus(200); // 2xx inmediato para que no reintente
+  try {
+    const ev = req.body || {};
+    if (ev.event !== 'message.received') return;
+    if (ev.id) {
+      if (vistos.has(ev.id)) return; // "al menos una vez" → dedupe
+      vistos.add(ev.id);
+      if (vistos.size > 500) vistos.delete(vistos.values().next().value);
+    }
+    const m = ev.message || {};
+    const senderId = (m.sender && m.sender.id) || '';
+    const conversationId = (ev.conversation && ev.conversation.id) || m.conversationId || '';
+    const accountId = (ev.account && ev.account.accountId) || m.accountId || '';
+    if (!senderId || !conversationId || !accountId) return;
+    recordarCanal(senderId, conversationId, accountId);
+    if (ev.metadata && ev.metadata.standby) return; // lo contesta Meta Business Agent
+    const atts = m.attachments || [];
+    const esTexto = !atts.length;
+    const att = atts[0] || {};
+    const tipoAtt = (att.type === 'image' || att.type === 'document' || att.type === 'video') ? att.type : null;
+    const msg = { from: senderId, type: esTexto ? 'text' : tipoAtt || 'text' };
+    if (esTexto) {
+      msg.text = { body: m.text || '' };
+    } else if (tipoAtt) {
+      const mime = att.mimeType || (tipoAtt === 'image' ? 'image/jpeg' : tipoAtt === 'document' ? 'application/pdf' : 'video/mp4');
+      msg[tipoAtt] = { id: att.url, url: att.url, mime_type: mime };
+    }
+    console.log(`Mensaje Zernio recibido de ${senderId} tipo ${msg.type}`);
+    procesar({}, msg).catch(err => console.error('procesar:', err.message));
+  } catch (ex) { console.error('webhook zernio:', ex.message); }
+});
+
+app.get('/', (req, res) => res.send('Bot whatsapp SSMA activo. v3'));
  app.get('/privacidad', (req, res) => {
    res.send('<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Política de Privacidad</title></head><body style="font-family:Arial,sans-serif;margin:2rem auto;max-width:720px;line-height:1.5"><h1>Política de Privacidad</h1><p><strong>Responsable:</strong> Secury Inovatech.</p><p>El bot de WhatsApp "Reportes de Seguridad Bot" procesa los siguientes datos para operar: número de WhatsApp del remitente, mensajes de texto e imágenes que el usuario envía voluntariamente como evidencia de los recorridos de seguridad, y la obra o sección seleccionada por el usuario.</p><p>Estos datos se utilizan únicamente para registrar y dar seguimiento a los reportes de seguridad solicitados, se almacenan en una base de datos segura y no se comparten con terceros, salvo obligación legal.</p><p>El usuario puede solicitar la corrección o eliminación de sus datos escribiendo al mismo número de WhatsApp del bot.</p><p><em>Última actualización: 28/09/2026.</em></p></body></html>');
  });
