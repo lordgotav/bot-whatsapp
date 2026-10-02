@@ -3105,7 +3105,7 @@ document.getElementById('visor').addEventListener('click', () =>
 /* Vista previa grande de evidencias al pasar el ratón (lupa) */
 (function () {
   const lupa = document.getElementById('lupa');
-  const SEL = '.foto-marco img, .ev-mini, .mfo-ev-item img, img[data-full]';
+  const SEL = '.foto-marco img, .ev-mini, .mfo-ev-item img, .mon-foto img, .mon-foto-sub img, img[data-full]';
   if (!lupa) return;
   document.addEventListener('mouseover', e => {
     const im = e.target.closest && e.target.closest(SEL) ? e.target.closest(SEL) : null;
@@ -3113,7 +3113,7 @@ document.getElementById('visor').addEventListener('click', () =>
     lupa._im = im;
     lupa.innerHTML = '';
     const n = new Image();
-    n.src = im.dataset.full || im.src;
+    n.src = im.dataset.full || im.dataset.src || im.src;
     n.addEventListener('load', () => lupa.classList.add('activa'));
     lupa.appendChild(n);
   });
@@ -3137,6 +3137,14 @@ document.getElementById('visor').addEventListener('click', () =>
     lupa.innerHTML = '';
   });
 })();
+
+/* Clic en fotos de monitoreo → pantalla completa */
+document.addEventListener('click', e => {
+  const img = e.target.closest ? e.target.closest('.mon-foto img, .mon-foto-sub img') : null;
+  if (!img) return;
+  document.getElementById('visorImg').src = img.dataset.full || img.src;
+  document.getElementById('visor').classList.add('abierto');
+});
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     document.getElementById('visor').classList.remove('abierto');
