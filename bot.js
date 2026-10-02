@@ -406,10 +406,10 @@ async function guardarTextoFuerza(remitente, destinatario, seccion, texto) {
 // Atajo sin foto SOLO para: APR, LOTO, Pausa y Cierre de permisos.
 // El marcador es el mismo texto que usa la app para tildar (✅ cumplido).
 const TILDES = [
-  { clave: 'apr',             etiqueta: 'Análisis de riesgos (APR)', marcador: '[Evidencia APR subida]',            re: /apr/ },
-  { clave: 'cierre_permisos', etiqueta: 'Cierre de permisos de trabajo', marcador: '[Sin cierre de permisos hoy] Sin Cierre Permisos hoy', re: /cierre\s*(de)?\s*permisos?|cerraron\s*permisos|encargad/ },
-  { clave: 'pausa',           etiqueta: 'Pausa de seguridad (cuando aplique)', marcador: 'Sin Pausa hoy',                     re: /pausa/ },
-  { clave: 'loto',            etiqueta: 'Verificación del procedimiento LOTO (cuando aplique)', marcador: 'Sin LOTOs hoy',                     re: /loto/ }
+  { clave: 'apr',             etiqueta: 'Análisis de riesgos (APR)', marcador: '[Evidencia APR subida]',            frase: 'ya subí mis apr', re: /apr/ },
+  { clave: 'cierre_permisos', etiqueta: 'Cierre de permisos de trabajo', marcador: '[Sin cierre de permisos hoy] Sin Cierre Permisos hoy', frase: 'no llegaron encargados y/o no se cerraron permisos', re: /cierre\s*(de)?\s*permisos?|cerraron\s*permisos|encargad/ },
+  { clave: 'pausa',           etiqueta: 'Pausa de seguridad (cuando aplique)', marcador: 'Sin Pausa hoy',                     frase: 'no se realizó pausa hoy', re: /pausa/ },
+  { clave: 'loto',            etiqueta: 'Verificación del procedimiento LOTO (cuando aplique)', marcador: 'Sin LOTOs hoy',                     frase: 'no se realizaron lotos hoy', re: /loto/ }
 ];
 // Para marcar sin foto, el mensaje debe parecer una confirmación/estado del día:
 const ACTIVADOR = /ya\s+(sub[ií]|envi[ée]|mand[ée]|puse|tengo|realic|realiz)|no\s+se\s+(realiz|hicieron|hizo)|no\s+(llegaron|hay|hubo)|sin\s+|cumplido|hoy\b/;
@@ -582,7 +582,9 @@ async function procesar(val, msg) {
         await enviar(destinatario, `${opcion.etiqueta}\n\nEscribe el informe de fuerza de trabajo (o "0" para cancelar).`);
       } else {
         const pedido = opcion.tipo === 'foto_pdf' ? 'foto o el PDF escaneado' : 'la foto';
-        await enviar(destinatario, `${opcion.etiqueta}\n\nSube aquí ${pedido} (o "0" para cancelar).`);
+        const atajo = TILDES.find(x => x.clave === opcion.clave);
+        const hint = atajo ? `\n\n💡 Escribe *"${atajo.frase}"* para marcarlo ✅ cumplido hoy sin subir evidencia.` : '';
+        await enviar(destinatario, `${opcion.etiqueta}\n\nSube aquí ${pedido} (o "0" para cancelar).${hint}`);
       }
       return;
     }
