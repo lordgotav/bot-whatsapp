@@ -399,13 +399,14 @@ async function guardarTextoFuerza(remitente, destinatario, seccion, texto) {
 }
 
 /* ---------------- SEGURIDAD: usuario + contraseña ---------------- */
-// La clave se guarda en Supabase como hash bcrypt (pgcrypto.crypt).
-// La verificación la hace la función RPC verificar_credencial (nunca lee hashes el bot).
+// Se usa Supabase Auth: el mismo correo+contraseña que usa la página.
+// El id de auth.users ES el id de perfiles, así la evidencia cae en el
+// perfil correcto y el cumplimiento se calcula con esas claves.
 function estaAutenticado(remitente) { return autenticados.has(remitente); }
 
 async function iniciarLogin(remitente, destinatario) {
   sesiones.set(remitente, { paso: 'login_usuario' });
-  await enviar(destinatario, '🔐 Para reportar necesitas identificarte.\n\nEscribe tu *usuario* (o "0" para cancelar).');
+  await enviar(destinatario, '🔐 Para reportar necesitas identificarte.\n\nEscribe tu *correo electrónico* (el mismo con el que entras a la página) o "0" para cancelar.');
 }
 
 // Procesa los pasos del login. Devuelve true si consumió el mensaje.
@@ -415,38 +416,42 @@ async function procesarLogin(remitente, destinatario, sesion, texto) {
     await enviar(destinatario, '✅ Identificación cancelada.');
     return true;
   }
-  if (sesion.paso === 'login_usuario') {
-    sesiones.set(remitente, { paso: 'login_clave', usuario: texto });
-    await enviar(destinatario, 'Ahora escribe tu *contraseña* (o "0" para cancelar).');
-    return true;
-  }
-  if (sesion.paso === 'login_clave') {
-    try {
-      const { data } = await supabase.rpc('verificar_credencial', { p_usuario: sesion.usuario, p_clave: texto });
-      const ok = data && data[0] && data[0].usuario;
-      if (!ok) {
-        sesiones.delete(remitente);
-        await enviar(destinatario, '❌ Usuario o contraseña incorrectos. Vuelve a escribir tu *usuario*.');
+  try {
+    if (sesion.paso === 'login_usuario') {
+      const email = texto.toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        await enviar(destinatario, 'Eso no parece un correo válido. Escríbelo de nuevo o "0" para cancelar.');
         return true;
       }
-      autenticados.set(remitente, {
-        user_id: data[0].user_id || null,
-        usuario: data[0].usuario,
-        nombre: data[0].perfil_nombre || sesion.usuario
-      });
+      sesiones.set(remitente, { paso: 'login_clave', usuario: email });
+      await enviar(destinatario, 'Ahora escribe tu *contraseña* (la misma de la página).');
+      return true;
+    }
+    if (sesion.paso === 'login_clave') {
+      // Valida contra Supabase Auth: el mismo correo+contraseña que usa la página.
+      const { data, error } = await supabase.auth.signInWithPassword({ email: sesion.usuario, password: texto });
+      if (error || !data.user) {
+        sesiones.delete(remitente);
+        await enviar(destinatario, '❌ Correo o contraseña incorrectos. Vuelve a escribir tu *correo*.');
+        return true;
+      }
+      const uid = data.user.id;
+      const { data: prof } = await supabase.from('perfiles').select('id, nombre').eq('id', uid).maybeSingle();
+      const nombre = (prof && prof.nombre) || sesion.usuario.split('@')[0];
+      autenticados.set(remitente, { user_id: uid, usuario: sesion.usuario, nombre });
       sesiones.delete(remitente);
-      await enviar(destinatario, `✅ ¡Hola ${data[0].perfil_nombre || sesion.usuario}! Identificación correcta.`);
+      await enviar(destinatario, `✅ ¡Hola ${nombre}! Identificación correcta.`);
       if (!TURNO_ID && !OBRA) return preguntarObra(remitente, destinatario); // multi-obra: elige su obra
       const turno = await resolverTurno(remitente);
       if (!turno) { await enviar(destinatario, '⚠️ No hay un turno activo para tu obra. Configúralo en la app.'); return true; }
       await enviar(destinatario, textoMenu());
       return true;
-    } catch (e) {
-      console.error('procesarLogin:', e.message);
-      sesiones.delete(remitente);
-      await enviar(destinatario, '⚠️ Falló la verificación. Vuelve a escribir tu *usuario*.');
-      return true;
     }
+  } catch (e) {
+    console.error('procesarLogin:', e.message);
+    sesiones.delete(remitente);
+    await enviar(destinatario, '⚠️ Falló la verificación. Vuelve a escribir tu *correo*.');
+    return true;
   }
   return false;
 }
@@ -463,7 +468,7 @@ async function procesar(val, msg) {
   // 🔐 SEGURIDAD: sin usuario+contraseña no se puede hacer nada
   if (sesion.paso === 'login_usuario' || sesion.paso === 'login_clave') {
     if (esTexto) return procesarLogin(remitente, destinatario, sesion, texto);
-    await enviar(destinatario, 'Escribe solo texto (usuario o contraseña).');
+    await enviar(destinatario, 'Escribe solo texto (correo o contraseña).');
     return;
   }
   if (!estaAutenticado(remitente)) {
