@@ -338,8 +338,9 @@ async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tip
     const esPdf = mime === 'application/pdf' || (mediaMeta.mime_type || '').includes('pdf');
     const ext = esPdf ? 'pdf' : 'jpg';
     const tipo = esPdf ? 'pdf' : 'foto';
+    const auth = autenticados.get(remitente);
     const usuario = await buscarUsuario(remitente);
-    const userId = usuario ? usuario.id : uuidDeRemitente(remitente);
+    const userId = (auth && auth.user_id) || (usuario ? usuario.id : uuidDeRemitente(remitente));
     const prefijo = esPdf ? 'monitoreo_form_pdf' : 'monitoreo_form_foto';
     const ruta = `${userId}/${Date.now()}_${prefijo}.${ext}`;
 
@@ -352,7 +353,7 @@ async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tip
       fecha: hoy(),
       form_clave: seccion.clave,
       user_id: userId,
-      nombre: (usuario && usuario.nombre) || 'Supervisor (WhatsApp)',
+      nombre: (auth && auth.nombre) || (usuario && usuario.nombre) || 'Supervisor (WhatsApp)',
       texto: '',
       media: mediaJson
     });
@@ -375,11 +376,12 @@ async function guardarTextoFuerza(remitente, destinatario, seccion, texto) {
   const turno = await resolverTurno(remitente);
   if (!turno) { await enviar(destinatario, '⚠️ No encontré tu obra. Escribe *cambiar obra* para elegirla.'); return; }
   try {
+    const auth = autenticados.get(remitente);
     const usuario = await buscarUsuario(remitente);
-    const userId = usuario ? usuario.id : uuidDeRemitente(remitente);
+    const userId = (auth && auth.user_id) || (usuario ? usuario.id : uuidDeRemitente(remitente));
     const { error } = await supabase.from('monitoreo_envios').insert({
       turno_id: turno.id, fecha: hoy(), form_clave: seccion.clave,
-      user_id: userId, nombre: (usuario && usuario.nombre) || 'Supervisor (WhatsApp)',
+      user_id: userId, nombre: (auth && auth.nombre) || (usuario && usuario.nombre) || 'Supervisor (WhatsApp)',
       texto, media: []
     });
     if (error) throw error;
