@@ -122,7 +122,8 @@ function mismoCelular(wa, cel) {
 }
 
 function textoMenu() {
-  return '📋 ¿De qué sección? Responde:\n\n' +
+  return 'Para abrir las opciones solo di la palabra "Menu".\n\n' +
+    '📋 ¿De qué sección? Responde:\n\n' +
     MENU.map(m => `${m.n}) ${m.etiqueta}`).join('\n') +
     '\n\n(Manda "0" para cancelar la sección en curso.)';
 }
@@ -354,7 +355,7 @@ async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tip
       form_clave: seccion.clave,
       user_id: userId,
       nombre: (auth && auth.nombre) || (usuario && usuario.nombre) || 'Supervisor (WhatsApp)',
-      texto: '',
+      texto: seccion.clave === 'apr' ? '[Evidencia APR subida]' : '',
       media: mediaJson
     });
     if (errIns) throw errIns;
@@ -363,7 +364,8 @@ async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tip
     const obra = turno.obra || 'la obra';
     await enviar(destinatario,
       `✅ ${seccion.etiqueta}, registrado en '${obra}' a las ${horaLocal()}.\n` +
-      `Avance ${hecho}/${total} formularios. ${comentario(pct)}`);
+      `Avance ${hecho}/${total} formularios. ${comentario(pct)}\n\n` +
+      `Para abrir el menu de opciones di la palabra "Menu"; para cargar otra Evidencia (Foto/PDF) vuelve a marcar el número de la sección donde quieres subir la evidencia.`);
   } catch (ex) {
     console.error('guardarEvidencia:', ex.message);
     await enviar(destinatario, '⚠️ Ocurrió un error al subir la evidencia. Inténtalo de nuevo.');
@@ -389,12 +391,64 @@ async function guardarTextoFuerza(remitente, destinatario, seccion, texto) {
     const obra = turno.obra || 'la obra';
     await enviar(destinatario,
       `✅ ${seccion.etiqueta}, registrado en '${obra}' a las ${horaLocal()}.\n` +
-      `Avance ${hecho}/${total} formularios. ${comentario(pct)}`);
+      `Avance ${hecho}/${total} formularios. ${comentario(pct)}\n\n` +
+      `Para abrir el menu de opciones di la palabra "Menu"; para cargar otra Evidencia (Foto/PDF) vuelve a marcar el número de la sección donde quieres subir la evidencia.`);
   } catch (ex) {
     console.error('guardarTextoFuerza:', ex.message);
     await enviar(destinatario, '⚠️ Ocurrió un error al guardar. Inténtalo de nuevo.');
   } finally {
     sesiones.delete(remitente);
+  }
+}
+
+/* ---------------- MARCADO SIN FOTO (tarea repetitiva) ---------------- */
+// Ej.: "ya subí mis apr" → marca esa sección como cumplida hoy sin volver a subir la foto.
+// Atajo sin foto SOLO para: APR, LOTO, Pausa y Cierre de permisos.
+// El marcador es el mismo texto que usa la app para tildar (✅ cumplido).
+const TILDES = [
+  { clave: 'apr',             etiqueta: 'Análisis de riesgos (APR)', marcador: '[Evidencia APR subida]',            re: /apr/ },
+  { clave: 'cierre_permisos', etiqueta: 'Cierre de permisos de trabajo', marcador: '[Sin cierre de permisos hoy] Sin Cierre Permisos hoy', re: /cierre\s*(de)?\s*permisos?|cerraron\s*permisos|encargad/ },
+  { clave: 'pausa',           etiqueta: 'Pausa de seguridad (cuando aplique)', marcador: 'Sin Pausa hoy',                     re: /pausa/ },
+  { clave: 'loto',            etiqueta: 'Verificación del procedimiento LOTO (cuando aplique)', marcador: 'Sin LOTOs hoy',                     re: /loto/ }
+];
+// Para marcar sin foto, el mensaje debe parecer una confirmación/estado del día:
+const ACTIVADOR = /ya\s+(sub[ií]|envi[ée]|mand[ée]|puse|tengo|realic|realiz)|no\s+se\s+(realiz|hicieron|hizo)|no\s+(llegaron|hay|hubo)|sin\s+|cumplido|hoy\b/;
+
+async function marcarConfirmacionTexto(remitente, destinatario, texto) {
+  const t = texto.toLowerCase();
+  if (!ACTIVADOR.test(t)) return false;
+  const trozo = t.replace(/[^a-záéíóúñ\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const seccion = TILDES.find(x => x.re.test(trozo));
+  if (!seccion) return false;
+  const turno = await resolverTurno(remitente);
+  if (!turno) { await enviar(destinatario, '⚠️ No encontré tu obra. Escribe *cambiar obra* si la eliges diferente.'); return false; }
+  const auth = autenticados.get(remitente);
+  const usuario = await buscarUsuario(remitente);
+  const userId = (auth && auth.user_id) || (usuario ? usuario.id : uuidDeRemitente(remitente));
+  const nombre = (auth && auth.nombre) || (usuario && usuario.nombre) || 'Supervisor (WhatsApp)';
+  try {
+    const { data: existentes } = await supabase.from('monitoreo_envios')
+      .select('id').eq('turno_id', turno.id).eq('fecha', hoy()).eq('user_id', userId).eq('form_clave', seccion.clave);
+    if (existentes && existentes.length) {
+      await enviar(destinatario, `ℹ️ Ese punto ya está marcado para hoy (${seccion.etiqueta}).`);
+      return true;
+    }
+    const marcador = seccion.marcador;
+    await supabase.from('monitoreo_envios').insert({
+      turno_id: turno.id, fecha: hoy(), form_clave: seccion.clave,
+      user_id: userId, nombre, texto: marcador, media: []
+    });
+    const { hecho, total, pct } = await calcularAvance(turno, userId, seccion.clave);
+    await enviar(destinatario,
+      `✅ ${seccion.etiqueta} marcado como cumplido hoy sin nueva evidencia.\n` +
+      `Avance ${hecho}/${total} formularios. ${comentario(pct)}\n\n` +
+      `Para abrir el menu de opciones di la palabra "Menu"; para cargar otra Evidencia (Foto/PDF) vuelve a marcar el número de la sección donde quieres subir la evidencia.`);
+    sesiones.delete(remitente);
+    return true;
+  } catch (ex) {
+    console.error('marcarConfirmacionTexto:', ex.message);
+    await enviar(destinatario, '⚠️ Ocurrió un error al marcar. Inténtalo de nuevo.');
+    return true;
   }
 }
 
@@ -505,10 +559,20 @@ async function procesar(val, msg) {
 
   // Llega TEXTO
   if (esTexto) {
+    // Comando "Menu" → reabrir las opciones en cualquier momento
+    if (/^(menu|men[uú]|opciones|ver menu)$/i.test(texto)) {
+      await enviar(destinatario, textoMenu());
+      return;
+    }
+
     // Sección "fuerza de trabajo" espera texto del informe
     if (sesion.paso === 'seccion' && sesion.tipo === 'texto' && texto !== '0') {
       return guardarTextoFuerza(remitente, destinatario, sesion, texto);
     }
+
+    // Atajo "ya subí mis apr" → marcar sin volver a subir la foto
+    const marcado = await marcarConfirmacionTexto(remitente, destinatario, texto);
+    if (marcado) return;
 
     // Elige sección 1-12
     const opcion = MENU.find(m => String(m.n) === texto);
