@@ -125,6 +125,7 @@ function textoMenu() {
   return 'Para abrir las opciones solo di la palabra "Menu".\n\n' +
     '📋 ¿De qué sección? Responde:\n\n' +
     MENU.map(m => `${m.n}) ${m.etiqueta}`).join('\n') +
+    '\n\n▶ *"iniciar turno"* para registrar tu hora de inicio.' +
     '\n\n(Manda "0" para cancelar la sección en curso.)';
 }
 
@@ -246,6 +247,43 @@ async function buscarUsuario(waId) {
   return p || null;
 }
 
+// Restaura la sesión desde supervisor_login (login persistente) si un redeploy
+// borró la memoria; así no se pierde la identidad del número de WhatsApp.
+async function restaurarSesion(remitente) {
+  if (autenticados.has(remitente)) return autenticados.get(remitente);
+  try {
+    const { data } = await supabase.from('supervisor_login')
+      .select('user_id, nombre').eq('wa_id', remitente).limit(1);
+    if (data && data[0]) {
+      const ses = {
+        user_id: data[0].user_id,
+        usuario: '',
+        nombre: data[0].nombre || 'Supervisor (WhatsApp)'
+      };
+      autenticados.set(remitente, ses);
+      return ses;
+    }
+  } catch (e) { console.error('restaurarSesion:', e.message); }
+  return null;
+}
+
+// Devuelve { user_id, nombre } del remitente para guardar evidencias/inicio de turno.
+// Prioridad: sesión (memoria o persistente) → coincidencia por celular en perfiles.
+// IMPORTANTE: lleva al perfil actual de Supabase para que la app muestre tu nombre real.
+async function resolverIdentidad(remitente) {
+  const auth = autenticados.get(remitente);
+  if (auth && auth.user_id) {
+    try {
+      const { data: prof } = await supabase.from('perfiles').select('nombre').eq('id', auth.user_id).maybeSingle();
+      return { user_id: auth.user_id, nombre: (prof && prof.nombre) || auth.nombre || 'Supervisor (WhatsApp)' };
+    } catch (e) { /* usa el nombre en memoria */ }
+    return { user_id: auth.user_id, nombre: auth.nombre || 'Supervisor (WhatsApp)' };
+  }
+  const usuario = await buscarUsuario(remitente);
+  if (usuario) return { user_id: usuario.id, nombre: usuario.nombre };
+  return null;
+}
+
 // Si el número no está en la app, generamos un UUID estable para ese remitente
 // (así el avance por persona funciona aunque no use la app).
 function uuidDeRemitente(waId) {
@@ -327,6 +365,44 @@ async function elegirObraConfirmada(remitente, destinatario, turno) {
   await enviar(destinatario, `✅ Obra *'${turno.obra}'* seleccionada.\n\n` + textoMenu());
 }
 
+// Inicia el turno del supervisor en monitoreo_inicios (igual que el botón "▶ Iniciar mi turno" de la app).
+// Requiere login previo (autenticados) para usar el user_id de auth.users.
+async function iniciarTurnoWhatsApp(remitente, destinatario) {
+  const turno = await resolverTurno(remitente);
+  if (!turno) { await enviar(destinatario, '⚠️ No encontré tu turno/obra. Si es multi-obra escribe *cambiar obra* para elegirla.'); return; }
+  const identidad = await resolverIdentidad(remitente);
+  const userId = (identidad && identidad.user_id) || null;
+  if (!userId) { await enviar(destinatario, '🔐 Para iniciar tu turno primero identifícate con tu *correo* y *contraseña*.'); return; }
+  const nombre = (identidad && identidad.nombre) || 'Supervisor (WhatsApp)';
+  try {
+    const { data: existentes } = await supabase.from('monitoreo_inicios')
+      .select('*').eq('turno_id', turno.id).eq('fecha', hoy()).eq('user_id', userId).limit(1);
+    if (existentes && existentes.length) {
+      await enviar(destinatario, `⏱️ Ya iniciaste tu turno hoy a las *${existentes[0].hora_inicio}* en *'${turno.obra}'*.`);
+      return;
+    }
+    const hora = horaLocal();
+    const { error } = await supabase.from('monitoreo_inicios').insert({
+      turno_id: turno.id, fecha: hoy(), user_id: userId, nombre, hora_inicio: hora
+    });
+    if (error) {
+      if (String(error.code) === '23505' || String(error.message || '').toLowerCase().includes('duplicate')) {
+        await enviar(destinatario, `ℹ️ Ya iniciaste tu turno hoy en *'${turno.obra}'*.`);
+        return;
+      }
+      console.error('iniciarTurnoWhatsApp insert:', error.message);
+      await enviar(destinatario, '⚠️ No se pudo registrar el inicio de turno: ' + error.message);
+      return;
+    }
+    await enviar(destinatario,
+      `▶️ *Turno iniciado* a las *${hora}* en *'${turno.obra}'*.\n\n` +
+      `Revise sus formularios pendientes del turno. Escribe *Menu* para ver las opciones.`);
+  } catch (e) {
+    console.error('iniciarTurnoWhatsApp:', e.message);
+    await enviar(destinatario, '⚠️ Ocurrió un error al iniciar turno. Inténtalo de nuevo.');
+  }
+}
+
 /* ---------------- GUARDADO DE EVIDENCIAS ---------------- */
 async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tipoMsg) {
   const turno = await resolverTurno(remitente);
@@ -339,9 +415,8 @@ async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tip
     const esPdf = mime === 'application/pdf' || (mediaMeta.mime_type || '').includes('pdf');
     const ext = esPdf ? 'pdf' : 'jpg';
     const tipo = esPdf ? 'pdf' : 'foto';
-    const auth = autenticados.get(remitente);
-    const usuario = await buscarUsuario(remitente);
-    const userId = (auth && auth.user_id) || (usuario ? usuario.id : uuidDeRemitente(remitente));
+    const identidad = await resolverIdentidad(remitente);
+    const userId = (identidad && identidad.user_id) || uuidDeRemitente(remitente);
     const prefijo = esPdf ? 'monitoreo_form_pdf' : 'monitoreo_form_foto';
     const ruta = `${userId}/${Date.now()}_${prefijo}.${ext}`;
 
@@ -354,7 +429,7 @@ async function guardarEvidencia(remitente, destinatario, seccion, mediaMeta, tip
       fecha: hoy(),
       form_clave: seccion.clave,
       user_id: userId,
-      nombre: (auth && auth.nombre) || (usuario && usuario.nombre) || 'Supervisor (WhatsApp)',
+      nombre: (identidad && identidad.nombre) || 'Supervisor (WhatsApp)',
       texto: seccion.clave === 'apr' ? '[Evidencia APR subida]' : '',
       media: mediaJson
     });
@@ -378,12 +453,11 @@ async function guardarTextoFuerza(remitente, destinatario, seccion, texto) {
   const turno = await resolverTurno(remitente);
   if (!turno) { await enviar(destinatario, '⚠️ No encontré tu obra. Escribe *cambiar obra* para elegirla.'); return; }
   try {
-    const auth = autenticados.get(remitente);
-    const usuario = await buscarUsuario(remitente);
-    const userId = (auth && auth.user_id) || (usuario ? usuario.id : uuidDeRemitente(remitente));
+    const identidad = await resolverIdentidad(remitente);
+    const userId = (identidad && identidad.user_id) || uuidDeRemitente(remitente);
     const { error } = await supabase.from('monitoreo_envios').insert({
       turno_id: turno.id, fecha: hoy(), form_clave: seccion.clave,
-      user_id: userId, nombre: (auth && auth.nombre) || (usuario && usuario.nombre) || 'Supervisor (WhatsApp)',
+      user_id: userId, nombre: (identidad && identidad.nombre) || 'Supervisor (WhatsApp)',
       texto, media: []
     });
     if (error) throw error;
@@ -422,10 +496,9 @@ async function marcarConfirmacionTexto(remitente, destinatario, texto) {
   if (!seccion) return false;
   const turno = await resolverTurno(remitente);
   if (!turno) { await enviar(destinatario, '⚠️ No encontré tu obra. Escribe *cambiar obra* si la eliges diferente.'); return false; }
-  const auth = autenticados.get(remitente);
-  const usuario = await buscarUsuario(remitente);
-  const userId = (auth && auth.user_id) || (usuario ? usuario.id : uuidDeRemitente(remitente));
-  const nombre = (auth && auth.nombre) || (usuario && usuario.nombre) || 'Supervisor (WhatsApp)';
+  const identidad = await resolverIdentidad(remitente);
+  const userId = (identidad && identidad.user_id) || uuidDeRemitente(remitente);
+  const nombre = (identidad && identidad.nombre) || 'Supervisor (WhatsApp)';
   try {
     const { data: existentes } = await supabase.from('monitoreo_envios')
       .select('id').eq('turno_id', turno.id).eq('fecha', hoy()).eq('user_id', userId).eq('form_clave', seccion.clave);
@@ -493,8 +566,12 @@ async function procesarLogin(remitente, destinatario, sesion, texto) {
       const { data: prof } = await supabase.from('perfiles').select('id, nombre').eq('id', uid).maybeSingle();
       const nombre = (prof && prof.nombre) || sesion.usuario.split('@')[0];
       autenticados.set(remitente, { user_id: uid, usuario: sesion.usuario, nombre });
+      // Persiste el login (supervisor_login) para que un redeploy de Render no pierda quién eres.
+      await supabase.from('supervisor_login')
+        .upsert({ wa_id: remitente, user_id: uid, nombre, updated_at: new Date().toISOString() })
+        .catch(e => console.error('persistirLogin:', e.message));
       sesiones.delete(remitente);
-      await enviar(destinatario, `✅ ¡Hola ${nombre}! Identificación correcta.`);
+      await enviar(destinatario, `✅ ¡Hola ${nombre}! Identificación correcta.\n\n▶ Para registrar tu hora de inicio escribe *iniciar turno*.`);
       if (!TURNO_ID && !OBRA) return preguntarObra(remitente, destinatario); // multi-obra: elige su obra
       const turno = await resolverTurno(remitente);
       if (!turno) { await enviar(destinatario, '⚠️ No hay un turno activo para tu obra. Configúralo en la app.'); return true; }
@@ -526,7 +603,7 @@ async function procesar(val, msg) {
     return;
   }
   if (!estaAutenticado(remitente)) {
-    return iniciarLogin(remitente, destinatario);
+    if (!(await restaurarSesion(remitente))) return iniciarLogin(remitente, destinatario);
   }
 
   // Comando para cambiar de obra (multi-obra)
@@ -563,6 +640,11 @@ async function procesar(val, msg) {
     if (/^(menu|men[uú]|opciones|ver menu)$/i.test(texto)) {
       await enviar(destinatario, textoMenu());
       return;
+    }
+
+    // Comando "iniciar turno" → registrar la hora de inicio en monitoreo_inicios
+    if (/^(iniciar|empezar|comenzar)\s+(mi\s+)?turno\b/i.test(texto)) {
+      return iniciarTurnoWhatsApp(remitente, destinatario);
     }
 
     // Sección "fuerza de trabajo" espera texto del informe
