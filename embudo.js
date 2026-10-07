@@ -19,11 +19,15 @@ const DEMO_UTC_OFFSET = process.env.DEMO_UTC_OFFSET || '-06:00';
 
 let supabase = null;
 let enviar = null;
+let alAvisar = null; // callback: se aviso al asesor -> bot.js guarda el pendiente
+let enviarCorreo = null; // callback: (prospecto, 'agendada'|'confirmada', {fecha,hora}) -> mailer
 const avisados = new Set(); // wa:fecha -> ya se le aviso al asesor hoy
 
 function init(cfg) {
   supabase = cfg.supabase;
   enviar = cfg.enviar;
+  if (typeof cfg.alAvisar === 'function') alAvisar = cfg.alAvisar;
+  if (typeof cfg.enviarCorreo === 'function') enviarCorreo = cfg.enviarCorreo;
 }
 
 function norma(s) {
@@ -465,6 +469,10 @@ async function agendarSlot(waId, destinatario, sesion, n, score) {
   const p2 = await leerProspecto(waId);
   await cerrar(waId, destinatario, sesion, score, true, slot);
   await avisarAsesor(p2, sesion);
+  if (enviarCorreo) {
+    try { await enviarCorreo(p2, 'agendada', { fecha: slot.fecha, hora: slot.hora }); }
+    catch (e) { console.error('embudo.correo agendada:', e.message); }
+  }
   return { salir: true };
 }
 
@@ -529,12 +537,67 @@ async function avisarAsesor(p, sesion) {
     `⭐ SCORE: *${p.score}/100*\n\n` +
     (slot ? `🗓️ *Cita:* ${fechaBonita(slot.fecha, slot.hora)}\n\n` : '') +
     `📱 WhatsApp: ${p.wa_id}\n\n` +
-    `Responde *SI* a este mensaje para confirmarle la cita.`;
+    `Responde *SI* para confirmarle la cita · *NO* para liberar el horario.`;
 
   try {
     await enviar(ASESOR_WA, m);
     await supabase.from('prospectos').update({ notas: 'avizado' }).eq('id', p.id);
+    if (alAvisar) { try { alAvisar(p); } catch (e) { console.error('embudo.alAvisar:', e.message); } }
   } catch (e) { console.error('embudo.avisarAsesor:', e.message); }
+}
+
+/* ------------------- CONFIRMAR / LIBERAR LA CITA -------------------
+   El asesor responde SI o NO al aviso; el bot actualiza la fila y
+   le avisa al prospecto.  Devuelven { ok, nombre, wa, fechaTexto }. */
+
+async function confirmarCita(prospectoId) {
+  if (!prospectoId) return { ok: false, error: 'sin prospecto' };
+  try {
+    const { data: p, error } = await supabase
+      .from('prospectos')
+      .update({ notas: 'confirmado', etapa: 'cita_confirmada' })
+      .eq('id', prospectoId)
+      .select('id, nombre, wa_id, slot_id')
+      .maybeSingle();
+    if (error) return { ok: false, error: error.message };
+    if (!p) return { ok: false, error: 'no encontré el prospecto' };
+
+    let fecha = null, hora = null;
+    if (p.slot_id) {
+      const { data: s } = await supabase.from('demo_slots')
+        .select('fecha, hora').eq('id', p.slot_id).maybeSingle();
+      if (s) { fecha = s.fecha; hora = s.hora; }
+    }
+    if (enviarCorreo) {
+      try { await enviarCorreo(p, 'confirmada', { fecha: fecha, hora: hora }); }
+      catch (e) { console.error('embudo.correo confirmada:', e.message); }
+    }
+    return {
+      ok: true, nombre: p.nombre, wa: p.wa_id,
+      fecha: fecha, hora: hora,
+      fechaTexto: fecha ? fechaBonita(fecha, hora) : null
+    };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
+async function liberarCita(prospectoId) {
+  if (!prospectoId) return { ok: false, error: 'sin prospecto' };
+  try {
+    const { data: p, error } = await supabase.from('prospectos')
+      .select('id, nombre, wa_id, slot_id').eq('id', prospectoId).maybeSingle();
+    if (error) return { ok: false, error: error.message };
+    if (!p) return { ok: false, error: 'no encontré el prospecto' };
+
+    if (p.slot_id) {
+      await supabase.from('demo_slots')
+        .update({ disponible: true, ocupado_por: null, motivo: null })
+        .eq('id', p.slot_id);
+    }
+    await supabase.from('prospectos')
+      .update({ slot_id: null, notas: 'liberado', etapa: 'seguimiento' })
+      .eq('id', prospectoId);
+    return { ok: true, nombre: p.nombre, wa: p.wa_id };
+  } catch (e) { return { ok: false, error: e.message }; }
 }
 
 async function leerSlot(id) {
@@ -544,4 +607,7 @@ async function leerSlot(id) {
   } catch (e) { return null; }
 }
 
-module.exports = { init, iniciar, procesar, agendarSlot, calcularBanda, pasosDe, textoPaso, DEMO_UMBRAL };
+module.exports = {
+  init, iniciar, procesar, agendarSlot, calcularBanda, pasosDe, textoPaso,
+  confirmarCita, liberarCita, DEMO_UMBRAL
+};

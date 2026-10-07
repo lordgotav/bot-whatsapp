@@ -24,6 +24,8 @@ const { createClient } = require('@supabase/supabase-js');
 const servicios = require('./servicios');
 const faqs = require('./faqs');
 const embudo = require('./embudo');
+const correo = require('./mailer');        // correos SMTP (cita agendada/confirmada)
+const recordatorios = require('./recordatorios'); // recordatorio 1 h antes
 
 // Número del asesor que recibe el aviso cuando hay un prospecto caliente
 const ASESOR_WA = (process.env.ASESOR_WA || '').replace(/\D/g, '');
@@ -89,6 +91,11 @@ const MENU = [
 //  - paso 'seccion': eligió sección del menú y espera su evidencia
 //  - paso 'login_*': se está identificando (usuario + contraseña)
 const sesiones = new Map();
+
+// Citas demo avisadas al asesor y aún sin confirmar (embudo -> alAvisar).
+// Se consume cuando el asesor responde SI (confirma) o NO (libera).
+//  [ { id, nombre, wa, slot } ]  -> el último es el más reciente
+const asesorPendientes = [];
 
 // Remitentes ya identificados (usuario + contraseña correctos)
 //  wa_id -> { user_id, usuario, nombre }
@@ -622,6 +629,70 @@ async function arrancarEmbudo(remitente, destinatario, sesion, servicio) {
   return r;
 }
 
+/* ------------------------- ASESOR: CONFIRMAR / LIBERAR -------------------------
+   El aviso de prospecto caliente termina pidiendo responder SI. Aquí se
+   procesa esa respuesta: confirma la cita (y le avisa al prospecto) o
+   libera el horario.  Devuelve true si el mensaje era del asesor. */
+
+function pendienteAsesor() {
+  return asesorPendientes.length ? asesorPendientes[asesorPendientes.length - 1] : null;
+}
+function olvidarPendiente(id) {
+  const i = asesorPendientes.findIndex(p => p.id === id);
+  if (i >= 0) asesorPendientes.splice(i, 1);
+}
+
+async function flujoAsesor(remitente, destinatario, texto) {
+  const t = normaTxt(texto).trim();
+  const esSi = /^(si|s|confirmar|confirmada|confirmado|ok|dale|listo|perfecto|sale)$/.test(t);
+  const esNo = /^(no|nop|cancelar|cancelada|cancelado|liberar|liberada|reagendar|otro dia)$/.test(t);
+  const pend = pendienteAsesor();
+
+  if (pend && esSi) {
+    const r = await embudo.confirmarCita(pend.id);
+    if (!r || !r.ok) {
+      await enviar(destinatario, '⚠️ No pude confirmar la cita (' + ((r && r.error) || 'error desconocido') + ').\n\nVuelve a responder *SI*.');
+      return true;
+    }
+    if (r.wa) {
+      await enviar(r.wa,
+        '✅ *¡Tu cita está confirmada!*\n\n' +
+        (r.fechaTexto ? `🗓️ ${r.fechaTexto}\n\n` : '') +
+        'Te escribimos 10 minutos antes por este mismo WhatsApp.\n\n' +
+        'Escribe *menu* para ver otros servicios.');
+    }
+    olvidarPendiente(pend.id);
+    await enviar(destinatario,
+      '✅ *Cita confirmada* con ' + (r.nombre || 'el prospecto') +
+      (r.fechaTexto ? ' — ' + r.fechaTexto : '') + '.\n\nYa le avisé al prospecto.');
+    return true;
+  }
+
+  if (pend && esNo) {
+    const r = await embudo.liberarCita(pend.id);
+    olvidarPendiente(pend.id);
+    if (!r || !r.ok) {
+      await enviar(destinatario, '⚠️ No pude liberar el horario (' + ((r && r.error) || 'error desconocido') + ').');
+      return true;
+    }
+    if (r.wa) {
+      await enviar(r.wa,
+        '⏳ Tu cita fue reagendada.\n\n' +
+        'Un asesor de ' + servicios.EMPRESA + ' te escribe por este mismo WhatsApp para proponerte otro horario.\n\n' +
+        'Escribe *menu* para ver otros servicios.');
+    }
+    await enviar(destinatario, '🗑️ Cita liberada' + (r.nombre ? ' de ' + r.nombre : '') + '. El horario volvió a estar disponible.');
+    return true;
+  }
+
+  if (!pend && (esSi || esNo)) {
+    await enviar(destinatario, '🤔 No tengo ninguna cita pendiente por confirmar.\n\nEscribe *menu* para ver los servicios.');
+    return true;
+  }
+
+  return false; // no es del asesor -> sigue el flujo normal
+}
+
 async function flujoProspecto(remitente, destinatario, texto, tipo, sesion) {
   // El bot de ventas solo conversa por texto
   if (tipo !== 'text') {
@@ -728,6 +799,11 @@ async function procesar(val, msg) {
     if (esTexto) return procesarLogin(remitente, destinatario, sesion, texto);
     await enviar(destinatario, 'Escribe solo texto (correo o contraseña).');
     return;
+  }
+
+  // 🧑‍💼 ASESOR: responde SI (confirma) o NO (libera) a un aviso de cita
+  if (ASESOR_WA && remitente === ASESOR_WA && esTexto && sesion.paso !== 'embudo') {
+    if (await flujoAsesor(remitente, destinatario, texto)) return;
   }
 
   // 📝 EMBUDO de prospecto en curso (solo mensaje privado)
@@ -925,7 +1001,28 @@ app.post('/webhook/zernio', (req, res) => {
 // Arranque de los módulos de ventas (servicios, FAQ y embudo)
 servicios.init(supabase);
 faqs.init(supabase);
-embudo.init({ supabase: supabase, enviar: enviar });
+correo.init();
+embudo.init({
+  supabase: supabase,
+  enviar: enviar,
+  enviarCorreo: correo.enviar,
+  // Se le avisó al asesor -> guarda la cita pendiente para su "SI" / "NO"
+  alAvisar: (p) => {
+    if (!p) return;
+    asesorPendientes.push({ id: p.id, nombre: p.nombre, wa: p.wa_id, slot: p.slot_id });
+    if (asesorPendientes.length > 20) asesorPendientes.shift();
+  }
+});
+
+// Recordatorio de citas 1 hora antes (WhatsApp + correo)
+async function revisarRecordatorios() {
+  try {
+    const n = await recordatorios.revisar({ supabase: supabase, enviar: enviar, correo: correo.enviar });
+    if (n) console.log(`recordatorios: ${n} recordatorio(s) enviado(s)`);
+  } catch (e) { console.error('recordatorios:', e.message); }
+}
+setInterval(revisarRecordatorios, 60 * 1000);
+revisarRecordatorios();
 
 app.listen(PORT, () => {
   console.log(`Bot activo en el puerto ${PORT}`);
