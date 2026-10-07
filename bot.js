@@ -20,6 +20,14 @@ const express = require('express');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
+// --- Bot de ventas: menu de servicios, FAQ y embudo de prospectos ---
+const servicios = require('./servicios');
+const faqs = require('./faqs');
+const embudo = require('./embudo');
+
+// Número del asesor que recibe el aviso cuando hay un prospecto caliente
+const ASESOR_WA = (process.env.ASESOR_WA || '').replace(/\D/g, '');
+
 /* ---------------- CONFIGURACIÓN (se carga desde .env) ---------------- */
 const PROVEEDOR = (process.env.PROVEEDOR || 'meta').toLowerCase();
 
@@ -588,6 +596,124 @@ async function procesarLogin(remitente, destinatario, sesion, texto) {
 }
 
 /* ---------------- PROCESAR MENSAJES ---------------- */
+/* ---------------- FLUJO DE VENTAS (privado sin autenticar) ----------------
+   1) Saludo + lista de servicios SECURY INOVATECH
+   2) Al elegir un servicio -> explicación + FAQ
+   3) "demo" -> embudo de calificación + cita
+   4) "0" -> login de la aplicación (monitoreo de turno)
+------------------------------------------------------------------------- */
+
+// Arranca (o reanuda) el embudo para el servicio elegido
+async function arrancarEmbudo(remitente, destinatario, sesion, servicio) {
+  const s = servicio || { clave: 'app', titulo: 'Diseño de aplicación para reportes/monitoreo' };
+  sesion.paso = 'embudo';
+  sesion.servicioClave = s.clave;
+  sesion.servicioTitulo = s.titulo;
+  sesion.embudoSlot = false;
+  sesiones.set(remitente, sesion);
+
+  const r = await embudo.iniciar({ waId: remitente, destinatario: destinatario, servicio: s });
+  if (r && r.salir) { sesiones.delete(remitente); return r; }
+  if (r && typeof r === 'object') {
+    sesion.embudoPaso = r.paso;
+    sesion.score = r.score || 0;
+    sesiones.set(remitente, sesion);
+  }
+  return r;
+}
+
+async function flujoProspecto(remitente, destinatario, texto, tipo, sesion) {
+  // El bot de ventas solo conversa por texto
+  if (tipo !== 'text') {
+    await enviar(destinatario, 'Por aquí solo manejo *texto* 😅.\n\n' + await servicios.saludo());
+    return;
+  }
+  const t = String(texto || '').trim();
+
+  // --- Estaba mostrando FAQ numeradas: 1..3 responde, 0 vuelve ---
+  if (sesion.faqSug && sesion.faqSug.length) {
+    if (/^[1-9]\d*$/.test(t)) {
+      const idx = Number(t) - 1;
+      const faq = faqs.porId(sesion.faqSug[idx]);
+      if (faq) {
+        await faqs.registrarConsulta(faq.pregunta, true, sesion.servicio ? sesion.servicio.clave : null, remitente);
+        await enviar(destinatario, faqs.textoFaq(faq) + '\n\n💡 Escribe *demo* para agendar una cita · *menu* para ver los servicios.');
+        return;
+      }
+    }
+    if (t === '0') {
+      delete sesion.faqSug;
+      sesiones.set(remitente, sesion);
+      await enviar(destinatario, await servicios.textoMenu());
+      return;
+    }
+  }
+
+  // --- Saludos / menú ---
+  if (/^(hola|buenas|buenos (dias|tardes|noches)|info|informacion|ayuda)$/i.test(t)) {
+    sesiones.delete(remitente);
+    await enviar(destinatario, await servicios.saludo());
+    return;
+  }
+  if (/^(menu|men[uú]|opciones|servicios|ver menu|inicio)$/i.test(t)) {
+    sesiones.delete(remitente);
+    await enviar(destinatario, await servicios.saludo());
+    return;
+  }
+
+  // --- Opciones numeradas del menú de servicios ---
+  const opcion = await servicios.porOpcion(t);
+
+  if (opcion && opcion.tipo === 'entrar') {
+    sesiones.delete(remitente);
+    return iniciarLogin(remitente, destinatario);
+  }
+
+  if (opcion && opcion.tipo === 'servicio') {
+    const s = opcion.servicio;
+    sesion.paso = 'menu_servicio';
+    sesion.servicio = s;
+    sesion.faqSug = faqs.destacadas(s.clave, 3).map(f => f.id);
+    sesiones.set(remitente, sesion);
+    await enviar(destinatario, servicios.textoServicio(s));
+    await enviar(destinatario, faqs.textoDestacadas(s.clave));
+    return;
+  }
+
+  // --- Palabra clave del embudo ---
+  if (/^(demo|cita|agendar|agendarme|cotizar|cotizacion|propuesta|quiero una demo|hablar con un asesor)\b/i.test(t)) {
+    const s = sesion.servicio || null;
+    return arrancarEmbudo(remitente, destinatario, sesion, s);
+  }
+
+  if (/^(asesor|humano|persona|que alguien me atienda|contacto)\b/i.test(t)) {
+    await enviar(destinatario,
+      '🤝 Un asesor de *SECURY INOVATECH* te escribe por este mismo WhatsApp en horario ' +
+      '*lunes a sábado de 9:00 a 1:00*.\n\n' +
+      'Si prefieres adelantarte, escribe *demo* y te agendo la cita ahora.');
+    return;
+  }
+
+  // --- Buscador de FAQ (con el servicio que tenga abierto) ---
+  const ctx = sesion.servicio ? sesion.servicio.clave : null;
+  const r = faqs.buscar(t, ctx);
+  if (r) {
+    await faqs.registrarConsulta(t, true, ctx, remitente);
+    await enviar(destinatario, faqs.textoFaq(r.faq) + '\n\n💡 Escribe *demo* para agendar una cita · *menu* para ver los servicios.');
+    return;
+  }
+
+  // --- No se entendió ---
+  await faqs.registrarConsulta(t, false, ctx, remitente);
+  await enviar(destinatario,
+    faqs.textoNoEncontrado(t, ctx, sesion.servicio ? sesion.servicio.titulo : null));
+  if (sesion.servicio && (!sesion.faqSug || !sesion.faqSug.length)) {
+    sesion.faqSug = faqs.destacadas(sesion.servicio.clave, 3).map(f => f.id);
+    sesiones.set(remitente, sesion);
+    await enviar(destinatario, faqs.textoDestacadas(sesion.servicio.clave));
+  }
+}
+
 async function procesar(val, msg) {
   const remitente = msg.from;
   const destinatario = (msg.context && msg.context.group_id) || remitente; // grupo o DM
@@ -595,16 +721,49 @@ async function procesar(val, msg) {
   const esTexto = tipo === 'text';
   const texto = esTexto ? ((msg.text && msg.text.body) || '').trim() : '';
   const sesion = sesiones.get(remitente) || {};
+  const esGrupo = destinatario !== remitente;
 
-  // 🔐 SEGURIDAD: sin usuario+contraseña no se puede hacer nada
+  // 🔐 LOGIN en curso (aplica en grupo y en privado)
   if (sesion.paso === 'login_usuario' || sesion.paso === 'login_clave') {
     if (esTexto) return procesarLogin(remitente, destinatario, sesion, texto);
     await enviar(destinatario, 'Escribe solo texto (correo o contraseña).');
     return;
   }
-  if (!estaAutenticado(remitente)) {
-    if (!(await restaurarSesion(remitente))) return iniciarLogin(remitente, destinatario);
+
+  // 📝 EMBUDO de prospecto en curso (solo mensaje privado)
+  if (sesion.paso === 'embudo' && esTexto) {
+    const r = await embudo.procesar({ waId: remitente, destinatario: destinatario, texto: texto, sesion: sesion });
+    if (r === true) return; // mensaje consumido (repitió la pregunta), la sesión sigue
+    if (r && r.salir) { sesiones.delete(remitente); return; }
+    if (r && typeof r === 'object') {
+      if (r.paso) sesion.embudoPaso = r.paso;
+      if (r.score !== undefined) sesion.score = r.score;
+      sesion.embudoSlot = (r.paso === 'slot');
+      sesion.paso = 'embudo';
+      sesiones.set(remitente, sesion);
+      return;
+    }
+    // r === false: el embudo no reconoce el mensaje -> se suelta y
+    // vuelve al flujo de servicios/FAQ de abajo.
+    sesiones.delete(remitente);
   }
+
+  // ¿Es supervisor identificado? (memoria o persistencia tras redeploy)
+  const autenticado = estaAutenticado(remitente) || (await restaurarSesion(remitente));
+
+  // 👷 SUPERVISOR o GRUPO -> flujo de monitoreo de turno (sin cambios)
+  if (autenticado || esGrupo) {
+    if (!autenticado) return iniciarLogin(remitente, destinatario);
+
+    // Comando de salida (solo privado): vuelve al menú de servicios
+    if (!esGrupo && esTexto && /^(salir|cerrar sesion|cerrar sesión)$/i.test(texto)) {
+      autenticados.delete(remitente);
+      await supabase.from('supervisor_login').delete().eq('wa_id', remitente)
+        .catch(e => console.error('salir:', e.message));
+      sesiones.delete(remitente);
+      await enviar(destinatario, '👋 Sesión cerrada.\n\n' + await servicios.saludo());
+      return;
+    }
 
   // Comando para cambiar de obra (multi-obra)
   if (esTexto && /^(cambiar|cambio|obra)\b/i.test(texto)) {
@@ -680,7 +839,12 @@ async function procesar(val, msg) {
   }
 
   // Llega algo sin haber elegido sección (foto inicial, voz, etc.)
-  if (sesion.paso !== 'seccion') { await enviar(destinatario, textoMenu()); }
+    if (sesion.paso !== 'seccion') { await enviar(destinatario, textoMenu()); }
+    return;
+  }
+
+  // 🎯 PRIVADO SIN AUTENTICAR -> menú de servicios, FAQ y embudo
+  return flujoProspecto(remitente, destinatario, texto, tipo, sesion);
 }
 
 /* ---------------- WEBHOOK (Meta <-> Bot) ---------------- */
@@ -752,9 +916,19 @@ app.post('/webhook/zernio', (req, res) => {
   } catch (ex) { console.error('webhook zernio:', ex.message); }
 });
 
-app.get('/', (req, res) => res.send('Bot whatsapp SSMA activo. v3'));
+ app.get('/', (req, res) => res.send('Bot SECURY INOVATECH activo. v4 (servicios + FAQ + embudo + monitoreo)'));
  app.get('/privacidad', (req, res) => {
    res.send('<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Política de Privacidad</title></head><body style="font-family:Arial,sans-serif;margin:2rem auto;max-width:720px;line-height:1.5"><h1>Política de Privacidad</h1><p><strong>Responsable:</strong> Secury Inovatech.</p><p>El bot de WhatsApp "Reportes de Seguridad Bot" procesa los siguientes datos para operar: número de WhatsApp del remitente, mensajes de texto e imágenes que el usuario envía voluntariamente como evidencia de los recorridos de seguridad, y la obra o sección seleccionada por el usuario.</p><p>Estos datos se utilizan únicamente para registrar y dar seguimiento a los reportes de seguridad solicitados, se almacenan en una base de datos segura y no se comparten con terceros, salvo obligación legal.</p><p>El usuario puede solicitar la corrección o eliminación de sus datos escribiendo al mismo número de WhatsApp del bot.</p><p><em>Última actualización: 28/09/2026.</em></p></body></html>');
  });
  const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Bot activo en el puerto ${PORT}`));
+
+// Arranque de los módulos de ventas (servicios, FAQ y embudo)
+servicios.init(supabase);
+faqs.init(supabase);
+embudo.init({ supabase: supabase, enviar: enviar });
+
+app.listen(PORT, () => {
+  console.log(`Bot activo en el puerto ${PORT}`);
+  console.log(`SECURY INOVATECH -> servicios + FAQ + embudo + monitoreo`);
+  console.log(`Asesor avisos: ${ASESOR_WA || '(sin ASESOR_WA en .env)'} | umbral demo: ${embudo.DEMO_UMBRAL}`);
+});
