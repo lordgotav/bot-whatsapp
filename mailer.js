@@ -43,9 +43,12 @@ function init() {
       host: host,
       port: port,
       secure: port === 465,
-      auth: { user: user, pass: pass }
+      auth: { user: user, pass: pass },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000
     });
     de = { name: EMPRESA, address: process.env.EMAIL_DE || user };
+    console.log(`correo: SMTP listo -> ${host}:${port} (BCC ${bccCorreo || 'sin copia'})`);
   } catch (e) {
     console.error('correo:', e.message);
     transporte = null;
