@@ -9,10 +9,12 @@
 // ============================================================
 const assert = require('assert');
 
-process.env.ASESOR_WA = '528331039200';
+process.env.ASESOR_WA = '5218331039200';
 process.env.DEMO_UMBRAL = '40';
 process.env.EMPRESA_NOMBRE = 'SECURY INOVATECH';
 process.env.DEMO_UTC_OFFSET = '-06:00';
+process.env.SMTP_STUB = 'true';
+process.env.ASESOR_EMAIL = 'gotav1988@gmail.com';
 
 /* ---------------- Supabase falso en memoria ---------------- */
 function crearSupabaseFake() {
@@ -263,9 +265,9 @@ embudo.init({ supabase, enviar });
   r = await embudo.procesar({ waId: wa, destinatario: wa, texto: '1', sesion });
   await prueba('cita agendada y embudo cerrado', () => {
     assert(r && r.salir === true, JSON.stringify(r));
-    const m = salidas.map(s => s.txt).join('\n');
+    const m = salidas.filter(s => s.dest === wa && !s.txt.includes('NUEVO PROSPECTO')).map(s => s.txt).join('\n');
     assert(m.includes('Cita demo agendada'), 'falta confirmacion de cita');
-    assert(m.includes('98/100'));
+    assert(!m.includes('/100'), 'el cliente no debe ver la calificación');
     assert(m.includes('Trial de 15 días'));
   });
   await prueba('slot marcado como ocupado', () => {
@@ -276,7 +278,7 @@ embudo.init({ supabase, enviar });
     assert.strictEqual(p.slot_id, ocupado.id);
   });
   await prueba('aviso enviado al asesor', () => {
-    const aviso = salidas.find(s => s.dest === '528331039200');
+    const aviso = salidas.find(s => s.txt.includes('NUEVO PROSPECTO CALIENTE'));
     assert(aviso, 'no llego el aviso al asesor');
     assert(aviso.txt.includes('NUEVO PROSPECTO CALIENTE'));
     assert(aviso.txt.includes('98/100'));
@@ -460,6 +462,23 @@ embudo.init({ supabase, enviar });
     const m = metas.find(x => x.espera);
     assert(salidas.some(s => s.dest === m.wa && s.txt.includes('Recordatorio')), 'falta el WhatsApp del recordatorio');
     assert(correos.some(c => c.tipo === 'recordatorio' && c.correo === 'pp30@x.com'), 'falta el correo del recordatorio');
+  });
+
+  const mailer = require('./mailer');
+  mailer.init();
+  await prueba('mail al prospecto con copia BCC al asesor', async () => {
+    const logs = [];
+    const origLog = console.log;
+    console.log = (...a) => logs.push(a.join(' '));
+    try {
+      await mailer.enviar({ correo: 'prueba@cliente.com', nombre: 'Ana Torres' }, 'agendada',
+        { fecha: '2026-10-10', hora: '10:00' });
+    } finally { console.log = origLog; }
+    assert(logs.some(l => l.includes('prueba@cliente.com') && l.includes('gotav1988@gmail.com')),
+      'falta la copia al asesor: ' + logs.join(' | '));
+    const msg = mailer.build({ correo: 'prueba@cliente.com', nombre: 'Ana Torres' }, 'agendada',
+      { fecha: '2026-10-10', hora: '10:00' });
+    assert(msg.asunto.includes('SECURY INOVATECH') && msg.html.includes('agendada'));
   });
 
   console.log(`\n✅ ${ok} comprobaciones OK\n`);

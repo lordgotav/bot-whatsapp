@@ -314,11 +314,10 @@ async function ultimaRespuesta(prospectoId) {
 function yaParticipo(p) {
   if (p.etapa === 'cita_agendada') {
     return `✅ *Ya tienes una cita agenda, ${String(p.nombre || '').split(' ')[0] || 'amigo'}:*\n\n` +
-      `· Score: ${p.score}/100 (${EMOJI_BANDA[p.banda] || p.banda})\n` +
       `· Un asesor te confirma por este mismo WhatsApp.\n\n` +
       `Escribe *menu* para ver otros servicios.`;
   }
-  return `✅ Ya dejaste tus datos, ${String(p.nombre || '').split(' ')[0] || 'amigo'} (score ${p.score}/100).\n\n` +
+  return `✅ Ya dejaste tus datos, ${String(p.nombre || '').split(' ')[0] || 'amigo'}.\n\n` +
     `Un asesor de ${EMPRESA} te contactará. Escribe *menu* para ver otros servicios.`;
 }
 
@@ -481,12 +480,10 @@ async function agendarSlot(waId, destinatario, sesion, n, score) {
 async function cerrar(waId, destinatario, sesion, score, conCita, slot) {
   const p = await leerProspecto(waId);
   const nombre = p && p.nombre ? String(p.nombre).split(' ')[0] : '';
-  const banda = calcularBanda(score);
   const etapa = conCita ? 'cita_agendada' : 'seguimiento';
   await guardarProspecto(waId, {}, score, etapa);
 
-  let m = `🎉 *Listo${nombre ? ' ' + nombre : ''}, ¡gracias!*\n\n` +
-    `📊 Tu puntaje: *${score}/100* — ${EMOJI_BANDA[banda]}\n\n`;
+  let m = `🎉 *Listo${nombre ? ' ' + nombre : ''}, ¡gracias!*\n\n`;
 
   if (p) {
     m += '*Tu resumen:*\n' +

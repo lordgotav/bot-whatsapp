@@ -20,8 +20,11 @@ const OFFSET = process.env.DEMO_UTC_OFFSET || '-06:00';
 let transporte = null;
 let de = { name: EMPRESA, address: '' };
 let modoStub = false;
+// Copia oculta (BCC) de cada correo al asesor (opcional)
+let bccCorreo = String(process.env.ASESOR_EMAIL || '').trim() || null;
 
 function init() {
+  bccCorreo = String(process.env.ASESOR_EMAIL || '').trim() || null;
   const host = process.env.SMTP_HOST;
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
@@ -110,16 +113,19 @@ async function enviar(p, tipo, extra) {
   const mensaje = build(p, tipo, extra);
   try {
     if (modoStub) {
-      console.log('correo [stub ' + tipo + '] -> ' + p.correo + ' · ' + mensaje.asunto);
+      console.log('correo [stub ' + tipo + '] -> ' + p.correo +
+        (bccCorreo ? ' + copia ' + bccCorreo : '') + ' · ' + mensaje.asunto);
       return;
     }
     const info = await transporte.sendMail({
       from: (de.name ? `"${de.name}" <${de.address || ''}>` : de.address),
       to: p.correo,
+      bcc: bccCorreo || undefined, // copia oculta al asesor
       subject: mensaje.asunto,
       html: mensaje.html
     });
-    console.log(`correo [${tipo}] -> ${p.correo} (${info.messageId})`);
+    console.log(`correo [${tipo}] -> ${p.correo}` +
+      (bccCorreo ? ' (copia ' + bccCorreo + ')' : '') + ` (${info.messageId})`);
   } catch (e) {
     console.error('correo: no se pudo enviar [' + tipo + '] a ' + p.correo + ':', e.message);
   }
